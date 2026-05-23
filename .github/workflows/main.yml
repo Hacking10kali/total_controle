@@ -11,6 +11,10 @@ on:
         description: "Dernière page catalogue"
         required: true
         default: "43"
+      parallel_pages:
+        description: "Pages traitées en parallèle (1-5 recommandé)"
+        required: false
+        default: "2"
   schedule:
     - cron: "0 4 * * 0"
 
@@ -33,7 +37,9 @@ jobs:
       - name: Sync catalogue → Firestore
         env:
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
-          PAGE_BEGIN: ${{ github.event.inputs.page_begin || '1' }}
-          PAGE_END: ${{ github.event.inputs.page_end || '10' }}
-          EPISODE_DELAY: "0.25"
+          PAGE_BEGIN:      ${{ github.event.inputs.page_begin      || '1'  }}
+          PAGE_END:        ${{ github.event.inputs.page_end        || '43' }}
+          PARALLEL_PAGES:  ${{ github.event.inputs.parallel_pages  || '2'  }}
+          EPISODE_DELAY:   "0.25"
         run: python firebase_full_sync.py
+
