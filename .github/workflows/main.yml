@@ -1,0 +1,39 @@
+name: firebase_full_sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_begin:
+        description: "Première page catalogue"
+        required: true
+        default: "1"
+      page_end:
+        description: "Dernière page catalogue"
+        required: true
+        default: "43"
+  schedule:
+    - cron: "0 4 * * 0"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          pip install -q playwright aiohttp firebase-admin
+          playwright install chromium --with-deps
+
+      - name: Sync catalogue → Firestore
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          PAGE_BEGIN: ${{ github.event.inputs.page_begin || '1' }}
+          PAGE_END: ${{ github.event.inputs.page_end || '10' }}
+          EPISODE_DELAY: "0.25"
+        run: python firebase_full_sync.py
