@@ -833,10 +833,12 @@ async def collect_lecteurs(page):
 
 async def scrape_saison_episodes(browser, saison_url):
     slug = "/".join(saison_url.rstrip("/").split("/")[-2:])
+    episodes: list = []
+
     for attempt in range(MAX_RETRIES):
         ctx = await new_ctx(browser)
         page = await ctx.new_page()
-        episodes, success = [], False
+        success = False
         try:
             await goto_page(page, saison_url)
             if await wait_select(page, "#selectEpisodes", timeout=25000):
@@ -859,35 +861,115 @@ async def scrape_saison_episodes(browser, saison_url):
                         await asyncio.sleep(EPISODE_DELAY)
                     success = True
         except Exception as e:
-            log(f"    error {slug}: {e}")
+            log(f"    error {slug} attempt {attempt+1}: {e}")
         finally:
             await ctx.close()
         if success:
             break
-        await asyncio.sleep(5)
+        await asyncio.sleep(5 * (attempt + 1))
+
+    if not episodes:
+        log(f"    SKIP no episodes: {slug}")
+        return []
+
+    # ── Retry des épisodes vides (lecteurs=[]) ───────────────────
+    vides = [i for i, e in enumerate(episodes) if not e["lecteurs"]]
+    if vides:
+        ratio = len(vides) / len(episodes)
+        pause = 15 if ratio > 0.4 else 5
+        log(f"    retry {len(vides)}/{len(episodes)} épisodes vides (pause {pause}s) [{slug}]")
+        await asyncio.sleep(pause)
+        ctx2 = await new_ctx(browser)
+        page2 = await ctx2.new_page()
+        try:
+            await goto_page(page2, saison_url)
+            if await wait_select(page2, "#selectEpisodes", timeout=20000):
+                await page2.wait_for_timeout(500)
+                eps_opts2 = await get_options(page2, "#selectEpisodes")
+                for i in vides:
+                    if i >= len(eps_opts2):
+                        continue
+                    ep = eps_opts2[i]
+                    try:
+                        await page2.select_option("#selectEpisodes", value=ep["value"])
+                        await page2.wait_for_timeout(400)
+                        if await wait_select(page2, "#selectLecteurs", timeout=10000):
+                            lects = await collect_lecteurs(page2)
+                            if lects:
+                                episodes[i] = {"episode": ep["label"], "lecteurs": lects}
+                        else:
+                            src2 = await wait_player(page2)
+                            if src2:
+                                episodes[i] = {"episode": ep["label"],
+                                               "lecteurs": [{"lecteur": "default", "url": src2}]}
+                    except Exception:
+                        pass
+                    await asyncio.sleep(EPISODE_DELAY)
+        except Exception as e:
+            log(f"    retry error [{slug}]: {e}")
+        finally:
+            await ctx2.close()
+
+    ok = sum(1 for e in episodes if e["lecteurs"])
+    log(f"    {ok}/{len(episodes)} OK [{slug}]")
     return episodes
 
 
 async def count_episodes_quick(browser, session, anime_lien, saison, langues) -> tuple[int, str, str | None]:
-    """Compte les épisodes (priorité VF). Retourne (count, langue, url)."""
+    """Compte les épisodes en testant VF puis VOSTFR.
+    Retourne (count, langue, url). Retry si le count est 0 malgré page chargée.
+    """
     titre = saison["titreVignette"]
-    url_cible, langue = await pick_saison_url_vf_first(session, anime_lien, titre)
-    if not url_cible:
-        return 0, langue or "vf", None
-    ctx = await new_ctx(browser)
-    page = await ctx.new_page()
-    count = 0
-    try:
-        await goto_page(page, url_cible)
-        if await wait_select(page, "#selectEpisodes", timeout=15000):
-            count = await page.evaluate(
-                "() => document.querySelector('#selectEpisodes')?.options.length || 0"
-            )
-    except Exception:
-        pass
-    finally:
-        await ctx.close()
-    return int(count), langue, url_cible
+    prefer_vf = "VF" in [l.upper() for l in (langues or [])]
+    url_vf = build_saison_url(anime_lien, titre, "vf")
+    url_vostfr = build_saison_url(anime_lien, titre, "vostfr")
+
+    # Ordre de préférence selon la langue de l'animé
+    candidates = []
+    if prefer_vf:
+        if url_vf:     candidates.append((url_vf, "vf"))
+        if url_vostfr: candidates.append((url_vostfr, "vostfr"))
+    else:
+        if url_vostfr: candidates.append((url_vostfr, "vostfr"))
+        if url_vf:     candidates.append((url_vf, "vf"))
+
+    for url_cible, langue in candidates:
+        for attempt in range(2):  # 2 tentatives par URL
+            ctx = await new_ctx(browser)
+            page = await ctx.new_page()
+            count = 0
+            try:
+                await goto_page(page, url_cible)
+                # Vérifier si la page a vraiment du contenu
+                has_content = await page.evaluate(
+                    "() => !!document.querySelector('#selectEpisodes') "
+                    "|| !!document.querySelector('#playerDF')"
+                )
+                if has_content and await wait_select(page, "#selectEpisodes", timeout=20000):
+                    # Double attente pour JS dynamique
+                    await page.wait_for_timeout(800)
+                    count = await page.evaluate(
+                        "() => document.querySelector('#selectEpisodes')?.options.length || 0"
+                    )
+                    if count == 0:
+                        await page.wait_for_timeout(2000)
+                        count = await page.evaluate(
+                            "() => document.querySelector('#selectEpisodes')?.options.length || 0"
+                        )
+            except Exception:
+                pass
+            finally:
+                await ctx.close()
+
+            if count > 0:
+                return int(count), langue, url_cible
+            if attempt == 0:
+                await asyncio.sleep(3)
+
+    # Fallback : retourner URL préférée avec count=0
+    fallback_url = url_vf if prefer_vf else url_vostfr
+    fallback_lang = "vf" if prefer_vf else "vostfr"
+    return 0, fallback_lang, fallback_url or url_vf
 
 
 async def scrape_detail(browser, url):
@@ -1156,6 +1238,10 @@ async def sync_one_anime(browser, session, fs: FirestoreSync, anime: dict, dry_r
         if not meta:
             log(f"    saison manquante: {sid} (site={site_count})")
             need_scrape.append((s, langue, site_count, fb_count, sid, True))
+        elif fb_count == 0:
+            # Saison présente dans Firebase mais VIDE → toujours re-scraper
+            log(f"    saison vide: {sid} (fb=0, site={site_count}) → force re-scrape")
+            need_scrape.append((s, langue, site_count, fb_count, sid, False))
         elif site_count > fb_count:
             log(f"    ep manquants: {sid} site={site_count} fb={fb_count}")
             need_scrape.append((s, langue, site_count, fb_count, sid, False))
@@ -1191,62 +1277,90 @@ async def sync_one_anime(browser, session, fs: FirestoreSync, anime: dict, dry_r
     return "ok"
 
 
-async def run(page_begin: int, page_end: int, dry_run: bool, skip_done: bool):
-    log("=== firebase_full_sync ===")
+async def _process_one_page(
+    browser, session, fs: FirestoreSync,
+    page_num: int, page_end: int,
+    dry_run: bool, skip_done: bool,
+    state: dict, stats: dict, lock: asyncio.Lock,
+):
+    """Traite une page catalogue complète (appelé en parallèle)."""
+    log(f"--- Page catalogue {page_num}/{page_end} ---")
+    animes = await scrape_catalogue_page(browser, page_num)
+    log(f"  page {page_num} — {len(animes)} animé(s)")
+
+    for i, anime in enumerate(animes, 1):
+        anime_id = slug_from_url(anime["lien"]) or f"unknown_{i}"
+        key = f"{page_num}|{anime_id}"
+
+        async with lock:
+            if skip_done and state.get("done", {}).get(key):
+                continue
+
+        log(f"[p{page_num} {i}/{len(animes)}] {anime['nom']}")
+        try:
+            status = await sync_one_anime(browser, session, fs, anime, dry_run=dry_run)
+        except Exception as e:
+            log(f"  ERROR p{page_num} [{anime.get('nom','?')}]: {e}")
+            status = "error"
+
+        async with lock:
+            if status == "created":
+                stats["created"] += 1
+            elif status == "updated":
+                stats["updated"] += 1
+            elif status == "ids_updated":
+                stats["ids_updated"] += 1
+            elif status == "error":
+                stats["errors"] += 1
+            else:
+                stats["ok"] += 1
+            state.setdefault("done", {})[key] = status
+            if not dry_run:
+                save_state(state)
+
+
+async def run(page_begin: int, page_end: int, dry_run: bool, skip_done: bool, parallel_pages: int = 1):
+    log(f"=== firebase_full_sync | pages {page_begin}-{page_end} | parallel={parallel_pages} ===")
     state = load_state()
     stats = state.setdefault(
         "stats",
         {"created": 0, "updated": 0, "ids_updated": 0, "ok": 0, "errors": 0},
     )
+    lock = asyncio.Lock()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-dev-shm-usage", "--disable-gpu"],
         )
-        connector = aiohttp.TCPConnector(limit=10)
+        connector = aiohttp.TCPConnector(limit=max(20, parallel_pages * 5))
         async with aiohttp.ClientSession(connector=connector) as session:
             fs = FirestoreSync(init_firestore())
 
-            for page_num in range(page_begin, page_end + 1):
-                log(f"--- Page catalogue {page_num}/{page_end} ---")
-                animes = await scrape_catalogue_page(browser, page_num)
-                log(f"  {len(animes)} animé(s)")
+            # Sémaphore pour limiter la concurrence des pages
+            sem = asyncio.Semaphore(parallel_pages)
 
-                for i, anime in enumerate(animes, 1):
-                    anime_id = slug_from_url(anime["lien"]) or f"unknown_{i}"
-                    key = f"{page_num}|{anime_id}"
-                    if skip_done and state.get("done", {}).get(key):
-                        continue
+            async def bounded_page(page_num):
+                async with sem:
+                    await _process_one_page(
+                        browser, session, fs,
+                        page_num, page_end,
+                        dry_run, skip_done,
+                        state, stats, lock,
+                    )
 
-                    log(f"[p{page_num} {i}/{len(animes)}] {anime['nom']}")
-                    try:
-                        status = await sync_one_anime(browser, session, fs, anime, dry_run=dry_run)
-                        if status == "created":
-                            stats["created"] += 1
-                        elif status == "updated":
-                            stats["updated"] += 1
-                        elif status == "ids_updated":
-                            stats["ids_updated"] += 1
-                        elif status.startswith("would_"):
-                            pass
-                        else:
-                            stats["ok"] += 1
-                        state.setdefault("done", {})[key] = status
-                    except Exception as e:
-                        log(f"  ERROR: {e}")
-                        stats["errors"] += 1
-                    if not dry_run:
-                        save_state(state)
+            tasks = [bounded_page(p_num) for p_num in range(page_begin, page_end + 1)]
+            await asyncio.gather(*tasks)
 
         await browser.close()
 
-        if not dry_run:
-            log("--- Reconstruction collection ids/ (jikan + kitsu) ---")
-            try:
-                fs.rebuild_global_ids_registry()
-            except Exception as e:
-                log(f"  WARN rebuild ids/: {e}")
+    if not dry_run:
+        log("--- Reconstruction collection ids/ (jikan + kitsu) ---")
+        try:
+            FirestoreSync(init_firestore()).rebuild_global_ids_registry()
+        except Exception as e:
+            log(f"  WARN rebuild ids/: {e}")
 
     save_state(state)
     log(
@@ -1259,8 +1373,13 @@ def main():
     ap = argparse.ArgumentParser(description="Sync catalogue anime-sama → Firestore")
     ap.add_argument("--dry-run", action="store_true", help="Liste sans écrire Firestore")
     ap.add_argument("--page-begin", type=int, default=int(os.environ.get("PAGE_BEGIN", "1")))
-    ap.add_argument("--page-end", type=int, default=int(os.environ.get("PAGE_END", "43")))
-    ap.add_argument("--no-skip", action="store_true", help="Re-vérifier même les animés déjà traités")
+    ap.add_argument("--page-end",   type=int, default=int(os.environ.get("PAGE_END",   "43")))
+    ap.add_argument("--no-skip",    action="store_true", help="Re-vérifier même les animés déjà traités")
+    ap.add_argument(
+        "--parallel-pages", type=int,
+        default=int(os.environ.get("PARALLEL_PAGES", "1")),
+        help="Nombre de pages catalogue traitées en parallèle (défaut: 1)",
+    )
     args = ap.parse_args()
 
     has_json = bool(os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip())
@@ -1272,7 +1391,12 @@ def main():
         print("ERROR: FIREBASE_SERVICE_ACCOUNT_JSON manquant", file=sys.stderr)
         return 2
 
-    asyncio.run(run(args.page_begin, args.page_end, args.dry_run, skip_done=not args.no_skip))
+    asyncio.run(run(
+        args.page_begin, args.page_end,
+        args.dry_run,
+        skip_done=not args.no_skip,
+        parallel_pages=max(1, args.parallel_pages),
+    ))
     return 0
 
 
