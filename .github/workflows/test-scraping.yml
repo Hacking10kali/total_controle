@@ -5,7 +5,7 @@ on:
     inputs:
       anime_name:
         description: 'Nom de l\'anime à tester'
-        required: true
+        required: 'true'
         type: string
       dry_run:
         description: 'Mode dry-run (sans écriture Firebase)'
