@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       anime_name:
-        description: 'Nom de l\'anime à tester'
-        required: 'true'
+        description: 'Nom de l anime à tester'
+        required: true
         type: string
       dry_run:
         description: 'Mode dry-run (sans écriture Firebase)'
         required: false
         type: boolean
-        default: true
+        default: 'true'
 
 jobs:
   test-scraping:
